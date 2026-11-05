@@ -1,0 +1,1 @@
+# fastify-github-action-merge-dependabot
