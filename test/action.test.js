@@ -1,0 +1,1214 @@
+'use strict'
+
+const { test, afterEach } = require('node:test')
+const proxyquire = require('proxyquire')
+const sinon = require('sinon')
+
+// Stubbing modules
+const core = require('@actions/core')
+const toolkit = require('actions-toolkit')
+
+const actionLog = require('../src/log')
+const actionGithubClient = require('../src/github-client')
+const verifyCommits = require('../src/verifyCommitSignatures')
+const mergeWindow = require('../src/mergeWindow')
+const { updateTypes } = require('../src/mapUpdateType')
+const { MERGE_STATUS, MERGE_STATUS_KEY } = require('../src/util')
+
+const BOT_NAME = 'dependabot[bot]'
+
+// TODO: Share this stubs with github-client test
+const data = 'octokit-result'
+const octokitStubs = {
+  get: sinon.stub().returns(Promise.resolve({ data })),
+  createReview: sinon.stub().returns(Promise.resolve({ data })),
+  merge: sinon.stub().returns(Promise.resolve({ data })),
+  listCommits: sinon.stub().returns(Promise.resolve({ data })),
+}
+
+const githubStub = {
+  getOctokit: () => ({
+    rest: {
+      pulls: octokitStubs,
+    },
+  }),
+}
+
+const createDependabotMetadata = (props = {}) => ({
+  updateType: 'update-version:semver-minor',
+  dependencyType: 'direct:development',
+  dependencyNames: 'react',
+  ...props,
+})
+
+function buildStubbedAction ({ payload, inputs, dependabotMetadata }) {
+  const coreStub = sinon.stub(core)
+  const toolkitStub = sinon
+    .stub(toolkit, 'logActionRefWarning')
+    .get(() => sinon.stub())
+
+  const contextStub = {
+    payload: {
+      pull_request: {
+        user: {
+          login: 'pr-user-login',
+        },
+      },
+      repository: {
+        owner: {
+          login: 'owner-login.',
+        },
+        name: 'repository-name',
+      },
+    },
+    ...{ payload },
+  }
+
+  const logStub = sinon.stub(actionLog)
+  const prStub = sinon.stub()
+  const prDiffStub = sinon.stub()
+  const prCommitsStub = sinon.stub()
+  const approveStub = sinon.stub()
+  const mergeStub = sinon.stub()
+  const enableAutoMergeStub = sinon.stub()
+
+  const clientStub = sinon.stub(actionGithubClient, 'githubClient').returns({
+    getPullRequest: prStub.resolves(),
+    approvePullRequest: approveStub.resolves(),
+    mergePullRequest: mergeStub.resolves(),
+    enableAutoMergePullRequest: enableAutoMergeStub.resolves(),
+    getPullRequestDiff: prDiffStub.resolves(),
+    getPullRequestCommits: prCommitsStub.resolves([]),
+  })
+
+  const verifyCommitsStub = sinon.stub(verifyCommits, 'verifyCommits')
+  const isWithinMergeWindowStub = sinon
+    .stub(mergeWindow, 'isWithinMergeWindow')
+    .returns(true)
+
+  const action = proxyquire('../src/action', {
+    '@actions/core': coreStub,
+    'actions-toolkit': toolkitStub,
+    './log': logStub,
+    './github-client': clientStub,
+    './mergeWindow': { isWithinMergeWindow: isWithinMergeWindowStub },
+  })
+  return {
+    action: props =>
+      action({
+        github: githubStub,
+        context: contextStub,
+        inputs: inputs || {},
+        dependabotMetadata: createDependabotMetadata(dependabotMetadata),
+        ...props,
+      }),
+    stubs: {
+      coreStub,
+      githubStub,
+      logStub,
+      prStub,
+      approveStub,
+      mergeStub,
+      enableAutoMergeStub,
+      prCommitsStub,
+      verifyCommitsStub,
+      isWithinMergeWindowStub,
+    },
+  }
+}
+
+afterEach(() => {
+  sinon.restore()
+})
+
+test('should not run if a pull request number is missing', async () => {
+  const { action, stubs } = buildStubbedAction({
+    payload: { issue: {} },
+  })
+  await action()
+  sinon.assert.notCalled(stubs.approveStub)
+  sinon.assert.notCalled(stubs.mergeStub)
+
+  sinon.assert.calledWith(
+    stubs.coreStub.setOutput,
+    MERGE_STATUS_KEY,
+    MERGE_STATUS.skippedNotADependabotPr
+  )
+})
+
+test(
+  'should retrieve PR info when trigger by non pull_request events',
+  async () => {
+    const PR_NUMBER = Math.random()
+    const { action, stubs } = buildStubbedAction({
+      payload: { 'not a pull_request': {} },
+      inputs: { 'pr-number': PR_NUMBER },
+    })
+
+    await action()
+
+    sinon.assert.calledOnce(stubs.prStub)
+  }
+)
+
+test('should skip non-dependabot PR', async () => {
+  const PR_NUMBER = Math.random()
+  const { action, stubs } = buildStubbedAction({
+    payload: { issue: {} },
+    inputs: { 'pr-number': PR_NUMBER },
+  })
+
+  stubs.prStub.resolves({
+    user: {
+      login: 'not dependabot',
+    },
+  })
+
+  await action()
+
+  sinon.assert.calledOnce(stubs.prStub)
+  sinon.assert.calledWithExactly(
+    stubs.logStub.logWarning,
+    'Not a dependabot PR, skipping.'
+  )
+  sinon.assert.notCalled(stubs.approveStub)
+  sinon.assert.notCalled(stubs.mergeStub)
+  sinon.assert.calledWith(
+    stubs.coreStub.setOutput,
+    MERGE_STATUS_KEY,
+    MERGE_STATUS.skippedNotADependabotPr
+  )
+})
+
+const prCommitsStubs = [
+  {
+    author: {
+      login: 'not dependabot',
+    },
+  },
+  {
+    author: undefined,
+  },
+]
+
+for (const prCommitsStub of prCommitsStubs) {
+  test('should skip PR with non dependabot commit', async () => {
+    const PR_NUMBER = Math.random()
+    const { action, stubs } = buildStubbedAction({
+      payload: {
+        pull_request: {
+          user: {
+            login: BOT_NAME,
+          },
+          number: PR_NUMBER,
+        },
+      },
+    })
+
+    stubs.prCommitsStub.resolves([prCommitsStub])
+
+    await action()
+
+    sinon.assert.calledOnce(stubs.prCommitsStub)
+    sinon.assert.calledWithExactly(
+      stubs.logStub.logWarning,
+      'PR contains non dependabot commits, skipping.'
+    )
+    sinon.assert.notCalled(stubs.approveStub)
+    sinon.assert.notCalled(stubs.mergeStub)
+
+    sinon.assert.calledWith(
+      stubs.coreStub.setOutput,
+      MERGE_STATUS_KEY,
+      MERGE_STATUS.skippedNotADependabotPr
+    )
+  })
+}
+
+for (const prCommitsStub of prCommitsStubs) {
+  test(
+    'should NOT skip PR with non dependabot commit when skip-verification is enabled',
+    async () => {
+      const PR_NUMBER = Math.random()
+      const { action, stubs } = buildStubbedAction({
+        payload: {
+          pull_request: {
+            user: {
+              login: BOT_NAME,
+            },
+            number: PR_NUMBER,
+          },
+        },
+        inputs: {
+          'skip-verification': true,
+        },
+      })
+      stubs.prCommitsStub.resolves([prCommitsStub])
+
+      await action()
+
+      sinon.assert.calledWithExactly(
+        stubs.logStub.logInfo,
+        'Dependabot merge completed'
+      )
+      sinon.assert.calledOnce(stubs.prCommitsStub)
+      sinon.assert.calledOnce(stubs.approveStub)
+      sinon.assert.calledOnce(stubs.mergeStub)
+
+      sinon.assert.calledWith(
+        stubs.coreStub.setOutput,
+        MERGE_STATUS_KEY,
+        MERGE_STATUS.merged
+      )
+    }
+  )
+}
+
+test(
+  'should skip PR if dependabot commit signatures cannot be verified',
+  async () => {
+    const PR_NUMBER = Math.random()
+    const { action, stubs } = buildStubbedAction({
+      payload: {
+        pull_request: {
+          user: {
+            login: BOT_NAME,
+          },
+          number: PR_NUMBER,
+        },
+      },
+    })
+
+    stubs.prCommitsStub.resolves([
+      {
+        author: {
+          login: 'dependabot[bot]',
+        },
+      },
+    ])
+
+    stubs.verifyCommitsStub.throws()
+
+    await action()
+
+    sinon.assert.calledWithExactly(
+      stubs.logStub.logWarning,
+      'PR contains invalid dependabot commit signatures, skipping.'
+    )
+    sinon.assert.notCalled(stubs.approveStub)
+    sinon.assert.notCalled(stubs.mergeStub)
+    sinon.assert.calledWith(
+      stubs.coreStub.setOutput,
+      MERGE_STATUS_KEY,
+      MERGE_STATUS.skippedCommitVerificationFailed
+    )
+  }
+)
+
+test(
+  'should review and merge even if commit signatures cannot be verified with skip-commit-verification',
+  async () => {
+    const PR_NUMBER = Math.random()
+    const { action, stubs } = buildStubbedAction({
+      payload: {
+        pull_request: {
+          user: {
+            login: BOT_NAME,
+          },
+          number: PR_NUMBER,
+        },
+      },
+      inputs: {
+        'skip-commit-verification': true,
+      },
+    })
+
+    stubs.prCommitsStub.resolves([
+      {
+        author: {
+          login: 'dependabot[bot]',
+        },
+      },
+    ])
+
+    await action()
+
+    sinon.assert.calledWithExactly(
+      stubs.logStub.logInfo,
+      'Dependabot merge completed'
+    )
+    sinon.assert.notCalled(stubs.coreStub.setFailed)
+    sinon.assert.calledOnce(stubs.approveStub)
+    sinon.assert.calledOnce(stubs.mergeStub)
+    sinon.assert.calledWith(
+      stubs.coreStub.setOutput,
+      MERGE_STATUS_KEY,
+      MERGE_STATUS.merged
+    )
+  }
+)
+
+test(
+  'should review and merge even if commit signatures cannot be verified when skip-verification is enabled',
+  async () => {
+    const PR_NUMBER = Math.random()
+    const { action, stubs } = buildStubbedAction({
+      payload: {
+        pull_request: {
+          user: {
+            login: BOT_NAME,
+          },
+          number: PR_NUMBER,
+        },
+      },
+      inputs: {
+        'skip-verification': true,
+      },
+    })
+
+    stubs.prCommitsStub.resolves([
+      {
+        author: {
+          login: 'dependabot[bot]',
+        },
+      },
+    ])
+
+    await action()
+
+    sinon.assert.calledWithExactly(
+      stubs.logStub.logInfo,
+      'Dependabot merge completed'
+    )
+    sinon.assert.notCalled(stubs.coreStub.setFailed)
+    sinon.assert.calledOnce(stubs.approveStub)
+    sinon.assert.calledOnce(stubs.mergeStub)
+
+    sinon.assert.calledWith(
+      stubs.coreStub.setOutput,
+      MERGE_STATUS_KEY,
+      MERGE_STATUS.merged
+    )
+  }
+)
+
+test(
+  'should review and merge even the user is not dependabot when skip-verification is enabled',
+  async () => {
+    const PR_NUMBER = Math.random()
+    const { action, stubs } = buildStubbedAction({
+      payload: {
+        pull_request: {
+          user: {
+            login: BOT_NAME,
+          },
+          number: PR_NUMBER,
+        },
+      },
+      inputs: {
+        'skip-verification': true,
+      },
+    })
+
+    stubs.prCommitsStub.resolves([
+      {
+        author: {
+          login: 'myCustomUser',
+        },
+      },
+    ])
+
+    await action()
+
+    sinon.assert.calledWithExactly(
+      stubs.logStub.logInfo,
+      'Dependabot merge completed'
+    )
+    sinon.assert.notCalled(stubs.coreStub.setFailed)
+    sinon.assert.calledOnce(stubs.approveStub)
+    sinon.assert.calledOnce(stubs.mergeStub)
+    sinon.assert.calledWith(
+      stubs.coreStub.setOutput,
+      MERGE_STATUS_KEY,
+      MERGE_STATUS.merged
+    )
+  }
+)
+
+test('should ignore excluded package', async () => {
+  const PR_NUMBER = Math.random()
+  const { action, stubs } = buildStubbedAction({
+    payload: {
+      pull_request: {
+        number: PR_NUMBER,
+        user: { login: BOT_NAME },
+      },
+    },
+    inputs: { 'pr-number': PR_NUMBER, target: 'any', exclude: 'react' },
+  })
+
+  await action()
+
+  sinon.assert.calledWithExactly(
+    stubs.logStub.logInfo,
+    '1 package(s) excluded: react. Skipping.'
+  )
+  sinon.assert.notCalled(stubs.approveStub)
+  sinon.assert.notCalled(stubs.mergeStub)
+  sinon.assert.calledWith(
+    stubs.coreStub.setOutput,
+    MERGE_STATUS_KEY,
+    MERGE_STATUS.skippedPackageExcluded
+  )
+})
+
+test('approve only should not merge', async () => {
+  const PR_NUMBER = Math.random()
+  const { action, stubs } = buildStubbedAction({
+    payload: { issue: {} },
+    inputs: {
+      'pr-number': PR_NUMBER,
+      target: 'any',
+      'approve-only': true,
+    },
+  })
+
+  stubs.prStub.resolves({
+    number: PR_NUMBER,
+    user: { login: BOT_NAME },
+  })
+
+  stubs.approveStub.resolves({ data: true })
+
+  await action()
+
+  sinon.assert.calledWithExactly(
+    stubs.logStub.logInfo,
+    'APPROVE_ONLY set, PR was approved but it will not be merged'
+  )
+  sinon.assert.notCalled(stubs.mergeStub)
+  sinon.assert.calledWith(
+    stubs.coreStub.setOutput,
+    MERGE_STATUS_KEY,
+    MERGE_STATUS.approved
+  )
+})
+
+test('should review and merge', async () => {
+  const PR_NUMBER = Math.random()
+  const { action, stubs } = buildStubbedAction({
+    payload: {
+      pull_request: {
+        number: PR_NUMBER,
+        user: { login: BOT_NAME },
+      },
+    },
+    inputs: { 'pr-number': PR_NUMBER, target: 'any' },
+  })
+
+  await action()
+
+  sinon.assert.calledWithExactly(
+    stubs.logStub.logInfo,
+    'Dependabot merge completed'
+  )
+  sinon.assert.calledOnce(stubs.approveStub)
+  sinon.assert.calledOnce(stubs.mergeStub)
+  sinon.assert.calledWith(
+    stubs.coreStub.setOutput,
+    MERGE_STATUS_KEY,
+    MERGE_STATUS.merged
+  )
+})
+
+test(
+  'should merge github-action-merge-dependabot minor release',
+  async () => {
+    const PR_NUMBER = Math.random()
+    const { action, stubs } = buildStubbedAction({
+      payload: {
+        pull_request: {
+          number: PR_NUMBER,
+          user: { login: BOT_NAME },
+        },
+      },
+      inputs: { 'pr-number': PR_NUMBER, target: 'any' },
+    })
+
+    await action()
+
+    sinon.assert.calledWithExactly(
+      stubs.logStub.logInfo,
+      'Dependabot merge completed'
+    )
+    sinon.assert.calledOnce(stubs.approveStub)
+    sinon.assert.calledOnce(stubs.mergeStub)
+    sinon.assert.calledWith(
+      stubs.coreStub.setOutput,
+      MERGE_STATUS_KEY,
+      MERGE_STATUS.merged
+    )
+  }
+)
+
+test(
+  'should not merge github-action-merge-dependabot major release',
+  async () => {
+    const PR_NUMBER = Math.random()
+    const { action, stubs } = buildStubbedAction({
+      payload: {
+        pull_request: {
+          number: PR_NUMBER,
+          user: { login: BOT_NAME },
+        },
+      },
+      inputs: { 'pr-number': PR_NUMBER, target: 'any' },
+      dependabotMetadata: {
+        updateType: updateTypes.major,
+        dependencyNames: 'github-action-merge-dependabot',
+      },
+    })
+
+    await action()
+
+    sinon.assert.calledOnce(stubs.coreStub.setFailed)
+    sinon.assert.notCalled(stubs.approveStub)
+    sinon.assert.notCalled(stubs.mergeStub)
+    sinon.assert.calledWith(
+      stubs.coreStub.setOutput,
+      MERGE_STATUS_KEY,
+      MERGE_STATUS.skippedCannotUpdateMajor
+    )
+  }
+)
+
+test('should review and merge', async () => {
+  const PR_NUMBER = Math.random()
+  const { action, stubs } = buildStubbedAction({
+    payload: {
+      pull_request: {
+        number: PR_NUMBER,
+        user: { login: BOT_NAME },
+      },
+    },
+    inputs: { 'pr-number': PR_NUMBER, target: 'any' },
+  })
+
+  await action()
+
+  sinon.assert.calledWithExactly(
+    stubs.logStub.logInfo,
+    'Dependabot merge completed'
+  )
+  sinon.assert.notCalled(stubs.coreStub.setFailed)
+  sinon.assert.calledOnce(stubs.approveStub)
+  sinon.assert.calledOnce(stubs.mergeStub)
+  sinon.assert.calledWith(
+    stubs.coreStub.setOutput,
+    MERGE_STATUS_KEY,
+    MERGE_STATUS.merged
+  )
+})
+
+test('should review and enable github auto-merge', async () => {
+  const PR_NUMBER = Math.random()
+  const PR_NODE_ID = Math.random()
+  const { action, stubs } = buildStubbedAction({
+    payload: {
+      pull_request: {
+        number: PR_NUMBER,
+        node_id: PR_NODE_ID,
+        user: { login: BOT_NAME },
+      },
+    },
+    inputs: {
+      'pr-number': PR_NUMBER,
+      target: 'any',
+      'use-github-auto-merge': true,
+    },
+  })
+
+  await action()
+
+  sinon.assert.calledWithExactly(
+    stubs.logStub.logInfo,
+    'USE_GITHUB_AUTO_MERGE set, PR was marked as auto-merge'
+  )
+  sinon.assert.notCalled(stubs.coreStub.setFailed)
+  sinon.assert.calledOnce(stubs.approveStub)
+  sinon.assert.calledOnce(stubs.enableAutoMergeStub)
+  sinon.assert.calledWith(
+    stubs.coreStub.setOutput,
+    MERGE_STATUS_KEY,
+    MERGE_STATUS.autoMerge
+  )
+})
+
+test('should forbid major when target is minor', async () => {
+  const PR_NUMBER = Math.random()
+
+  const { action, stubs } = buildStubbedAction({
+    payload: {
+      pull_request: {
+        number: PR_NUMBER,
+        user: { login: BOT_NAME },
+      },
+    },
+    inputs: {
+      PR_NUMBER,
+      target: 'minor',
+      exclude: 'react',
+    },
+    dependabotMetadata: createDependabotMetadata({
+      updateType: updateTypes.major,
+    }),
+  })
+
+  await action()
+
+  sinon.assert.calledWithExactly(
+    stubs.logStub.logWarning,
+    `Semver bump is higher than allowed in TARGET.
+Tried to do a '${updateTypes.major}' update but the max allowed is '${updateTypes.minor}'`
+  )
+  sinon.assert.notCalled(stubs.approveStub)
+  sinon.assert.notCalled(stubs.mergeStub)
+  sinon.assert.calledWith(
+    stubs.coreStub.setOutput,
+    MERGE_STATUS_KEY,
+    MERGE_STATUS.skippedBumpHigherThanTarget
+  )
+})
+
+test('should forbid minor when target is patch', async () => {
+  const PR_NUMBER = Math.random()
+
+  const { action, stubs } = buildStubbedAction({
+    payload: {
+      pull_request: {
+        number: PR_NUMBER,
+        user: { login: BOT_NAME },
+      },
+    },
+    inputs: {
+      PR_NUMBER,
+      target: 'patch',
+      exclude: 'react',
+    },
+    dependabotMetadata: createDependabotMetadata({
+      updateType: updateTypes.minor,
+    }),
+  })
+
+  await action()
+
+  sinon.assert.calledWithExactly(
+    stubs.logStub.logWarning,
+    `Semver bump is higher than allowed in TARGET.
+Tried to do a '${updateTypes.minor}' update but the max allowed is '${updateTypes.patch}'`
+  )
+  sinon.assert.notCalled(stubs.approveStub)
+  sinon.assert.notCalled(stubs.mergeStub)
+  sinon.assert.calledWith(
+    stubs.coreStub.setOutput,
+    MERGE_STATUS_KEY,
+    MERGE_STATUS.skippedBumpHigherThanTarget
+  )
+})
+
+test('should forbid when update type is missing', async () => {
+  const PR_NUMBER = Math.random()
+
+  const { action, stubs } = buildStubbedAction({
+    payload: {
+      pull_request: {
+        number: PR_NUMBER,
+        user: { login: BOT_NAME },
+      },
+    },
+    inputs: {
+      PR_NUMBER,
+      target: 'minor',
+      exclude: 'react',
+    },
+    dependabotMetadata: createDependabotMetadata({
+      updateType: null,
+    }),
+  })
+
+  await action()
+
+  sinon.assert.calledWithExactly(
+    stubs.logStub.logWarning,
+    'Semver bump \'null\' is invalid!'
+  )
+  sinon.assert.notCalled(stubs.approveStub)
+  sinon.assert.notCalled(stubs.mergeStub)
+  sinon.assert.calledWith(
+    stubs.coreStub.setOutput,
+    MERGE_STATUS_KEY,
+    MERGE_STATUS.skippedInvalidVersion
+  )
+})
+
+test('should forbid when update type is not valid', async () => {
+  const PR_NUMBER = Math.random()
+
+  const { action, stubs } = buildStubbedAction({
+    payload: {
+      pull_request: {
+        number: PR_NUMBER,
+        user: { login: BOT_NAME },
+      },
+    },
+    inputs: {
+      PR_NUMBER,
+      target: 'minor',
+      exclude: 'react',
+    },
+    dependabotMetadata: createDependabotMetadata({
+      updateType: 'semver:invalid',
+    }),
+  })
+
+  await action()
+
+  sinon.assert.calledWithExactly(
+    stubs.logStub.logWarning,
+    'Semver bump \'semver:invalid\' is invalid!'
+  )
+  sinon.assert.notCalled(stubs.approveStub)
+  sinon.assert.notCalled(stubs.mergeStub)
+  sinon.assert.calledWith(
+    stubs.coreStub.setOutput,
+    MERGE_STATUS_KEY,
+    MERGE_STATUS.skippedInvalidVersion
+  )
+})
+
+test('should allow minor when target is major', async () => {
+  const PR_NUMBER = Math.random()
+
+  const { action, stubs } = buildStubbedAction({
+    payload: {
+      pull_request: {
+        number: PR_NUMBER,
+        user: { login: BOT_NAME },
+      },
+    },
+    inputs: {
+      PR_NUMBER,
+      target: 'major',
+    },
+    dependabotMetadata: createDependabotMetadata({
+      updateType: updateTypes.minor,
+    }),
+  })
+
+  await action()
+
+  sinon.assert.calledWithExactly(
+    stubs.logStub.logInfo,
+    'Dependabot merge completed'
+  )
+  sinon.assert.notCalled(stubs.coreStub.setFailed)
+  sinon.assert.calledOnce(stubs.approveStub)
+  sinon.assert.calledOnce(stubs.mergeStub)
+  sinon.assert.calledWith(
+    stubs.coreStub.setOutput,
+    MERGE_STATUS_KEY,
+    MERGE_STATUS.merged
+  )
+})
+
+test(
+  'should pick target-development version for dev package update',
+  async () => {
+    const PR_NUMBER = Math.random()
+
+    const { action, stubs } = buildStubbedAction({
+      payload: {
+        pull_request: {
+          number: PR_NUMBER,
+          user: { login: BOT_NAME },
+        },
+      },
+      inputs: {
+        PR_NUMBER,
+        target: 'minor',
+        'target-development': 'major',
+      },
+      dependabotMetadata: createDependabotMetadata({
+        updateType: updateTypes.major,
+        dependencyType: 'direct:development',
+      }),
+    })
+
+    await action()
+
+    sinon.assert.calledWithExactly(
+      stubs.logStub.logInfo,
+      'Dependabot merge completed'
+    )
+    sinon.assert.notCalled(stubs.coreStub.setFailed)
+    sinon.assert.calledOnce(stubs.approveStub)
+    sinon.assert.calledOnce(stubs.mergeStub)
+    sinon.assert.calledWith(
+      stubs.coreStub.setOutput,
+      MERGE_STATUS_KEY,
+      MERGE_STATUS.merged
+    )
+  }
+)
+
+test(
+  'should pick target-production version for production package update',
+  async () => {
+    const PR_NUMBER = Math.random()
+
+    const { action, stubs } = buildStubbedAction({
+      payload: {
+        pull_request: {
+          number: PR_NUMBER,
+          user: { login: BOT_NAME },
+        },
+      },
+      inputs: {
+        PR_NUMBER,
+        'target-development': 'major',
+        'target-production': 'minor',
+      },
+      dependabotMetadata: createDependabotMetadata({
+        updateType: updateTypes.major,
+        dependencyType: 'direct:production',
+      }),
+    })
+
+    await action()
+
+    sinon.assert.calledWithExactly(
+      stubs.logStub.logWarning,
+      `Semver bump is higher than allowed in TARGET.
+Tried to do a '${updateTypes.major}' update but the max allowed is '${updateTypes.minor}'`
+    )
+    sinon.assert.notCalled(stubs.approveStub)
+    sinon.assert.notCalled(stubs.mergeStub)
+    sinon.assert.calledWith(
+      stubs.coreStub.setOutput,
+      MERGE_STATUS_KEY,
+      MERGE_STATUS.skippedBumpHigherThanTarget
+    )
+  }
+)
+
+test(
+  'should pick target-indirect version for indirect package update',
+  async () => {
+    const PR_NUMBER = Math.random()
+
+    const { action, stubs } = buildStubbedAction({
+      payload: {
+        pull_request: {
+          number: PR_NUMBER,
+          user: { login: BOT_NAME },
+        },
+      },
+      inputs: {
+        'pr-number': PR_NUMBER,
+        target: 'patch',
+        'target-indirect': 'major',
+      },
+      dependabotMetadata: createDependabotMetadata({
+        updateType: updateTypes.major,
+        dependencyType: 'indirect',
+      }),
+    })
+
+    await action()
+
+    sinon.assert.calledWithExactly(
+      stubs.logStub.logInfo,
+      'Dependabot merge completed'
+    )
+    sinon.assert.notCalled(stubs.coreStub.setFailed)
+    sinon.assert.calledOnce(stubs.approveStub)
+    sinon.assert.calledOnce(stubs.mergeStub)
+    sinon.assert.calledWith(
+      stubs.coreStub.setOutput,
+      MERGE_STATUS_KEY,
+      MERGE_STATUS.merged
+    )
+  }
+)
+
+// https://github.com/dependabot/dependabot-core/issues/4893
+test(
+  'should merge if target-indirect is any and update-type metadata is not set',
+  async () => {
+    const PR_NUMBER = Math.random()
+
+    const { action, stubs } = buildStubbedAction({
+      payload: {
+        pull_request: {
+          number: PR_NUMBER,
+          user: { login: BOT_NAME },
+        },
+      },
+      inputs: {
+        'pr-number': PR_NUMBER,
+        target: 'patch',
+        'target-indirect': 'any',
+      },
+      dependabotMetadata: createDependabotMetadata({
+        updateType: '',
+        dependencyType: 'indirect',
+      }),
+    })
+
+    await action()
+
+    sinon.assert.calledWithExactly(
+      stubs.logStub.logInfo,
+      'Dependabot merge completed'
+    )
+    sinon.assert.notCalled(stubs.coreStub.setFailed)
+    sinon.assert.calledOnce(stubs.approveStub)
+    sinon.assert.calledOnce(stubs.mergeStub)
+    sinon.assert.calledWith(
+      stubs.coreStub.setOutput,
+      MERGE_STATUS_KEY,
+      MERGE_STATUS.merged
+    )
+  }
+)
+
+test(
+  'should pick target version for production package update if target-production is not set',
+  async () => {
+    const PR_NUMBER = Math.random()
+
+    const { action, stubs } = buildStubbedAction({
+      payload: {
+        pull_request: {
+          number: PR_NUMBER,
+          user: { login: BOT_NAME },
+        },
+      },
+      inputs: {
+        PR_NUMBER,
+        'target-development': 'major',
+        target: 'patch',
+      },
+      dependabotMetadata: createDependabotMetadata({
+        updateType: updateTypes.major,
+        dependencyType: 'direct:production',
+      }),
+    })
+
+    await action()
+
+    sinon.assert.calledWithExactly(
+      stubs.logStub.logWarning,
+      `Semver bump is higher than allowed in TARGET.
+Tried to do a '${updateTypes.major}' update but the max allowed is '${updateTypes.patch}'`
+    )
+    sinon.assert.notCalled(stubs.approveStub)
+    sinon.assert.notCalled(stubs.mergeStub)
+    sinon.assert.calledWith(
+      stubs.coreStub.setOutput,
+      MERGE_STATUS_KEY,
+      MERGE_STATUS.skippedBumpHigherThanTarget
+    )
+  }
+)
+
+test(
+  'should pick target version for development package update if target-development is not set',
+  async () => {
+    const PR_NUMBER = Math.random()
+
+    const { action, stubs } = buildStubbedAction({
+      payload: {
+        pull_request: {
+          number: PR_NUMBER,
+          user: { login: BOT_NAME },
+        },
+      },
+      inputs: {
+        PR_NUMBER,
+        'target-production': 'major',
+        target: 'patch',
+      },
+      dependabotMetadata: createDependabotMetadata({
+        updateType: updateTypes.major,
+        dependencyType: 'direct:development',
+      }),
+    })
+
+    await action()
+
+    sinon.assert.calledWithExactly(
+      stubs.logStub.logWarning,
+      `Semver bump is higher than allowed in TARGET.
+Tried to do a '${updateTypes.major}' update but the max allowed is '${updateTypes.patch}'`
+    )
+    sinon.assert.notCalled(stubs.approveStub)
+    sinon.assert.notCalled(stubs.mergeStub)
+    sinon.assert.calledWith(
+      stubs.coreStub.setOutput,
+      MERGE_STATUS_KEY,
+      MERGE_STATUS.skippedBumpHigherThanTarget
+    )
+  }
+)
+
+test(
+  'should pick target version for development package update if target-indirect is not set',
+  async () => {
+    const PR_NUMBER = Math.random()
+
+    const { action, stubs } = buildStubbedAction({
+      payload: {
+        pull_request: {
+          number: PR_NUMBER,
+          user: { login: BOT_NAME },
+        },
+      },
+      inputs: {
+        PR_NUMBER,
+        target: 'patch',
+      },
+      dependabotMetadata: createDependabotMetadata({
+        updateType: updateTypes.major,
+        dependencyType: 'direct:development',
+      }),
+    })
+
+    await action()
+
+    sinon.assert.calledWithExactly(
+      stubs.logStub.logWarning,
+      `Semver bump is higher than allowed in TARGET.
+Tried to do a '${updateTypes.major}' update but the max allowed is '${updateTypes.patch}'`
+    )
+    sinon.assert.notCalled(stubs.approveStub)
+    sinon.assert.notCalled(stubs.mergeStub)
+    sinon.assert.calledWith(
+      stubs.coreStub.setOutput,
+      MERGE_STATUS_KEY,
+      MERGE_STATUS.skippedBumpHigherThanTarget
+    )
+  }
+)
+
+test('should skip when outside the configured merge-window', async () => {
+  const PR_NUMBER = Math.random()
+  const { action, stubs } = buildStubbedAction({
+    payload: {
+      pull_request: {
+        number: PR_NUMBER,
+        user: { login: BOT_NAME },
+      },
+    },
+    inputs: {
+      'pr-number': PR_NUMBER,
+      target: 'any',
+      'merge-window': '0-59 9-16 * * 1-5',
+      'merge-window-timezone': 'Europe/London',
+    },
+  })
+
+  stubs.isWithinMergeWindowStub.returns(false)
+
+  await action()
+
+  sinon.assert.calledWithExactly(stubs.isWithinMergeWindowStub, {
+    mergeWindow: '0-59 9-16 * * 1-5',
+    timezone: 'Europe/London',
+  })
+  sinon.assert.calledWithExactly(
+    stubs.logStub.logInfo,
+    "Outside of the configured merge-window ('0-59 9-16 * * 1-5' in Europe/London), skipping."
+  )
+  sinon.assert.notCalled(stubs.approveStub)
+  sinon.assert.notCalled(stubs.mergeStub)
+  sinon.assert.calledWith(
+    stubs.coreStub.setOutput,
+    MERGE_STATUS_KEY,
+    MERGE_STATUS.skippedOutsideMergeWindow
+  )
+})
+
+test(
+  'should skip when outside the merge-window without a timezone',
+  async () => {
+    const PR_NUMBER = Math.random()
+    const { action, stubs } = buildStubbedAction({
+      payload: {
+        pull_request: {
+          number: PR_NUMBER,
+          user: { login: BOT_NAME },
+        },
+      },
+      inputs: {
+        'pr-number': PR_NUMBER,
+        target: 'any',
+        'merge-window': '0-59 9-16 * * 1-5',
+      },
+    })
+
+    stubs.isWithinMergeWindowStub.returns(false)
+
+    await action()
+
+    sinon.assert.calledWithExactly(stubs.isWithinMergeWindowStub, {
+      mergeWindow: '0-59 9-16 * * 1-5',
+      timezone: undefined,
+    })
+    sinon.assert.calledWithExactly(
+      stubs.logStub.logInfo,
+      "Outside of the configured merge-window ('0-59 9-16 * * 1-5'), skipping."
+    )
+    sinon.assert.notCalled(stubs.approveStub)
+    sinon.assert.notCalled(stubs.mergeStub)
+    sinon.assert.calledWith(
+      stubs.coreStub.setOutput,
+      MERGE_STATUS_KEY,
+      MERGE_STATUS.skippedOutsideMergeWindow
+    )
+  }
+)
+
+test('should merge when inside the configured merge-window', async () => {
+  const PR_NUMBER = Math.random()
+  const { action, stubs } = buildStubbedAction({
+    payload: {
+      pull_request: {
+        number: PR_NUMBER,
+        user: { login: BOT_NAME },
+      },
+    },
+    inputs: {
+      'pr-number': PR_NUMBER,
+      target: 'any',
+      'merge-window': '0-59 9-16 * * 1-5',
+    },
+  })
+
+  stubs.isWithinMergeWindowStub.returns(true)
+
+  await action()
+
+  sinon.assert.calledOnce(stubs.isWithinMergeWindowStub)
+  sinon.assert.calledWithExactly(
+    stubs.logStub.logInfo,
+    'Dependabot merge completed'
+  )
+  sinon.assert.calledOnce(stubs.approveStub)
+  sinon.assert.calledOnce(stubs.mergeStub)
+  sinon.assert.calledWith(
+    stubs.coreStub.setOutput,
+    MERGE_STATUS_KEY,
+    MERGE_STATUS.merged
+  )
+})
