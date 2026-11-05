@@ -1,0 +1,39 @@
+name: Test custom inputs without a pull request
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          exclude: 'react, lodash; express'
+          approve-only: 'true'
+          merge-method: 'not-a-method'
+          merge-comment: 'Merged automatically'
+          target: 'minor'
+          target-development: 'major'
+          target-production: 'patch'
+          target-indirect: 'minor'
+          skip-commit-verification: 'true'
+          skip-verification: 'true'
+          merge-window: '0 9-16 * * 1-5'
+          merge-window-timezone: 'Europe/London'
+      - name: Assert merge_status is skipped:not_a_dependabot_pr
+        env:
+          ACTUAL: ${{ steps.action.outputs.merge_status }}
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "actual: $ACTUAL"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "FAIL: expected step to succeed"
+            exit 1
+          fi
+          if [ "$ACTUAL" != "skipped:not_a_dependabot_pr" ]; then
+            echo "FAIL: expected 'skipped:not_a_dependabot_pr'"
+            exit 1
+          fi
+          echo "PASS"
