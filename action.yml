@@ -85,7 +85,7 @@ runs:
           "https://actions.enforce.dev/actions/v1/record" >/dev/null 2>&1 || true
     - name: Fetch metadata
       id: dependabot-metadata
-      uses: chainguard-actions/dependabot-fetch-metadata@b03392889fc38a9326489e6febae25656070d2a0 # v2.5.0
+      uses: chainguard-actions/dependabot-fetch-metadata@7e7bba4bb21901997e87e0aa79fdd9153d855c0a # v2.5.0
       if: github.event_name == 'pull_request' && (github.actor == 'dependabot[bot]' || inputs.skip-verification == 'true')
       with:
         skip-commit-verification: ${{ inputs.skip-commit-verification }}
